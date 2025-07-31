@@ -721,7 +721,7 @@ class WanAttentionBlock(nn.Module):
         split_attn = (context is not None 
                       and (context.shape[0] > 1 or (clip_embed is not None and clip_embed.shape[0] > 1)) 
                       and x.shape[0] == 1
-                      and inner_t is not None
+                      and inner_t is None
                       )
         if split_attn:
             y = self.self_attn.forward_split(
@@ -965,17 +965,7 @@ class MLPProj(torch.nn.Module):
         return clip_extra_context_tokens
 
 
-class WanModel(ModelMixin, ConfigMixin):
-    r"""
-    Wan diffusion backbone supporting both text-to-video and image-to-video.
-    """
-
-    ignore_for_config = [
-        'patch_size', 'cross_attn_norm', 'qk_norm', 'text_dim'
-    ]
-    _no_split_modules = ['WanAttentionBlock']
-
-    @register_to_config
+class WanModel(torch.nn.Module):
     def __init__(self,
                  model_type='t2v',
                  patch_size=(1, 2, 2),
@@ -1066,6 +1056,8 @@ class WanModel(ModelMixin, ConfigMixin):
         self.rope_func = rope_func
         self.main_device = main_device
         self.offload_device = offload_device
+        self.vace_layers = vace_layers
+        self.device = main_device
 
         self.blocks_to_swap = -1
         self.offload_txt_emb = False

@@ -1294,18 +1294,19 @@ class WanVideoSampler:
                 "freeinit_args": ("FREEINITARGS", ),
                 "start_step": ("INT", {"default": 0, "min": 0, "max": 10000, "step": 1, "tooltip": "Start step for the sampling, 0 means full sampling, otherwise samples only from this step"}),
                 "end_step": ("INT", {"default": -1, "min": -1, "max": 10000, "step": 1, "tooltip": "End step for the sampling, -1 means full sampling, otherwise samples only until this step"}),
+                "add_noise_to_samples": ("BOOLEAN", {"default": False, "tooltip": "Add noise to the samples before sampling, needed for video2video sampling when starting from clean video"}),
             }
         }
 
-    RETURN_TYPES = ("LATENT", )
-    RETURN_NAMES = ("samples",)
+    RETURN_TYPES = ("LATENT", "LATENT",)
+    RETURN_NAMES = ("samples", "denoised_samples",)
     FUNCTION = "process"
     CATEGORY = "WanVideoWrapper"
 
     def process(self, model, image_embeds, shift, steps, cfg, seed, scheduler, riflex_freq_index, text_embeds=None,
         force_offload=True, samples=None, feta_args=None, denoise_strength=1.0, context_options=None, 
         cache_args=None, teacache_args=None, flowedit_args=None, batched_cfg=False, slg_args=None, rope_function="default", loop_args=None, 
-        experimental_args=None, sigmas=None, unianimate_poses=None, fantasytalking_embeds=None, uni3c_embeds=None, multitalk_embeds=None, freeinit_args=None, start_step=0, end_step=-1):
+        experimental_args=None, sigmas=None, unianimate_poses=None, fantasytalking_embeds=None, uni3c_embeds=None, multitalk_embeds=None, freeinit_args=None, start_step=0, end_step=-1, add_noise_to_samples=False):
         
         patcher = model
         model = model.model
@@ -1336,8 +1337,6 @@ class WanVideoSampler:
         multitalk_sampling = image_embeds.get("multitalk_sampling", False)
         if not multitalk_sampling and scheduler == "multitalk":
             raise Exception("multitalk scheduler is only for multitalk sampling when using ImagetoVideoMultiTalk -node")
-        
-        steps = int(steps/denoise_strength)
 
         if text_embeds == None:
             text_embeds = {
@@ -1347,30 +1346,44 @@ class WanVideoSampler:
         else:
             text_embeds = dict_to_device(text_embeds, device)
 
-        if isinstance(cfg, list):
-            if steps != len(cfg):
-                log.info(f"Received {len(cfg)} cfg values, but only {steps} steps. Setting step count to match.")
-                steps = len(cfg)
-        else:
-            cfg = [cfg] * (steps +1)
-
         seed_g = torch.Generator(device=torch.device("cpu"))
         seed_g.manual_seed(seed)
 
-        # Scheduler
+        #region Scheduler
         if scheduler != "multitalk":
             sample_scheduler, timesteps = get_scheduler(scheduler, steps, shift, device, transformer.dim, flowedit_args, denoise_strength, sigmas=sigmas)
         else:
             timesteps = torch.tensor([1000, 750, 500, 250], device=device)
         log.info(f"sigmas: {sample_scheduler.sigmas}")
+        
+        steps = len(timesteps)
 
-        if end_step != -1 or end_step >= steps:
+        if denoise_strength < 1.0:
+            if start_step != 0:
+                raise ValueError("start_step must be 0 when denoise_strength is used")
+            start_step = steps - int(steps * denoise_strength) - 1
+            add_noise_to_samples = True #for now to not break old workflows
+
+        first_sampler = (end_step != -1 or end_step >= steps)
+
+        if isinstance(cfg, list):
+            if steps != len(cfg):
+                log.info(f"Received {len(cfg)} cfg values, but only {steps} steps. Setting step count to match.")
+                steps = len(cfg)
+        else:
+            cfg = [cfg] * (steps + 1)
+
+        if first_sampler:
             timesteps = timesteps[:end_step]
             sample_scheduler.sigmas = sample_scheduler.sigmas[:end_step+1]
-        elif start_step > 0:
+            log.info(f"Sampling until step {end_step}, timestep: {timesteps[-1]}")
+        if start_step > 0:
             timesteps = timesteps[start_step:]
             sample_scheduler.sigmas = sample_scheduler.sigmas[start_step:]
+            log.info(f"Skipping first {start_step} steps, starting from timestep {timesteps[0]}")
 
+        log.info(f"timesteps: {timesteps}")
+        
         if hasattr(sample_scheduler, 'timesteps'):
             sample_scheduler.timesteps = timesteps
 
@@ -1379,10 +1392,6 @@ class WanVideoSampler:
         for arg in list(scheduler_step_args.keys()):
             if arg not in step_sig.parameters:
                 scheduler_step_args.pop(arg)
-        
-        if denoise_strength < 1.0:
-            steps = int(steps * denoise_strength)
-            timesteps = timesteps[-(steps + 1):] 
        
         control_latents = control_camera_latents = clip_fea = clip_fea_neg = end_image = recammaster = camera_embed = unianim_data = None
         vace_data = vace_context = vace_scale = None
@@ -1698,7 +1707,7 @@ class WanVideoSampler:
             if input_samples.shape[1] != noise.shape[1]:
                input_samples = torch.cat([input_samples[:, :1].repeat(1, noise.shape[1] - input_samples.shape[1], 1, 1), input_samples], dim=1)
             
-            if denoise_strength < 1.0:
+            if add_noise_to_samples:
                latent_timestep = timesteps[:1].to(noise)
                noise = noise * latent_timestep / 1000 + (1 - latent_timestep / 1000) * input_samples
             else:
@@ -1864,6 +1873,7 @@ class WanVideoSampler:
         # FlowEdit setup
         if flowedit_args is not None:
             source_embeds = flowedit_args["source_embeds"]
+            source_embeds = dict_to_device(source_embeds, device)
             source_image_embeds = flowedit_args.get("source_image_embeds", image_embeds)
             source_image_cond = source_image_embeds.get("image_embeds", None)
             source_clip_fea = source_image_embeds.get("clip_fea", clip_fea)
@@ -2472,6 +2482,12 @@ class WanVideoSampler:
                     context_pbar = ProgressBar(steps)
                     step_start_progress = idx
 
+                    # Validate all context windows before processing
+                    max_idx = latent_model_input.shape[1] if latent_model_input.ndim > 1 else 0
+                    for window_indices in context_queue:
+                        if not all(0 <= idx < max_idx for idx in window_indices):
+                            raise ValueError(f"Invalid context window indices {window_indices} for latent_model_input with shape {latent_model_input.shape}")
+
                     for i, c in enumerate(context_queue):
                         window_id = self.window_tracker.get_window_id(c)
                         
@@ -2486,7 +2502,7 @@ class WanVideoSampler:
                         
                         # Use the appropriate prompt for this section
                         if len(text_embeds["prompt_embeds"]) > 1:
-                            positive = text_embeds["prompt_embeds"][prompt_index]
+                            positive = [text_embeds["prompt_embeds"][prompt_index]]
                         else:
                             positive = text_embeds["prompt_embeds"]
 
@@ -2846,7 +2862,7 @@ class WanVideoSampler:
                     latent = latent.to(intermediate_device)
                     latent = sample_scheduler.step(
                         noise_pred[:, :orig_noise_len].unsqueeze(0) if recammaster is not None else noise_pred.unsqueeze(0),
-                        t,
+                        timestep,
                         latent[:, :orig_noise_len].unsqueeze(0) if recammaster is not None else latent.unsqueeze(0),
                         **scheduler_step_args)[0].squeeze(0)
                     
@@ -2863,7 +2879,6 @@ class WanVideoSampler:
                         callback(idx, callback_latent, None, len(timesteps))
                     else:
                         pbar.update(1)
-                    del latent_model_input, timestep
                 else:
                     if callback is not None:
                         callback_latent = (zt_tgt.to(device) - vt_tgt.to(device) * t.to(device) / 1000).detach().permute(1,0,2,3)
@@ -2898,7 +2913,9 @@ class WanVideoSampler:
             "has_ref": has_ref, 
             "drop_last": drop_last,
             "generator_state": seed_g.get_state(),
-        },)
+        },{
+            "samples": (latent_model_input.cpu() - noise_pred.cpu() * t.cpu() / 1000).unsqueeze(0), 
+        })
 
 #region VideoDecode
 class WanVideoDecode:

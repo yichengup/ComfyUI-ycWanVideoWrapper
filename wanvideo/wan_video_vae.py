@@ -1485,6 +1485,7 @@ class WanVideoVAE38(WanVideoVAE):
         self.std = torch.tensor(std)
         self.scale = [self.mean, 1.0 / self.std]
         self.dtype = dtype
+        self.z_dim = z_dim
 
         # init model
         self.model = VideoVAE38_(z_dim=z_dim, dim=dim, dtype=dtype).eval().requires_grad_(False)

@@ -5,7 +5,7 @@ from comfy.taesd.taesd import TAESD
 import comfy.model_management
 import folder_paths
 import comfy.utils
-import logging
+from comfy.latent_formats import Wan21, Wan22
 import os
 import struct
 
@@ -73,20 +73,19 @@ def get_previewer(device, latent_format):
     previewer = None
     method = args.preview_method
     if method != LatentPreviewMethod.NoPreviews:
-        # TODO previewer methods
-
         if method == LatentPreviewMethod.Auto:
             method = LatentPreviewMethod.Latent2RGB
 
         if method == LatentPreviewMethod.TAESD:
-            taehv_path = os.path.join(folder_paths.models_dir, "vae_approx", "taew2_1.safetensors")
-            if not os.path.exists(taehv_path):
-                raise RuntimeError(f"Could not find {taehv_path}")
-            taew_sd = comfy.utils.load_torch_file(taehv_path)
-            taesd = TAEHV(taew_sd).to(device)
-            previewer = TAESDPreviewerImpl(taesd)
-            previewer = WrappedPreviewer(previewer, rate=16)
-
+            if latent_format == Wan22: # No TAEW currently available for Wan2.2 VAE
+                method = LatentPreviewMethod.Latent2RGB
+            else:
+                taehv_path = folder_paths.get_full_path("vae_approx", "taew2_1.safetensors")
+                if not os.path.exists(taehv_path):
+                    raise RuntimeError(f"Could not find {taehv_path}, you can download it from https://huggingface.co/Kijai/WanVideo_comfy/blob/main/taew2_1.safetensors")
+                taesd = TAEHV(comfy.utils.load_torch_file(taehv_path)).to(device)
+                previewer = TAESDPreviewerImpl(taesd)
+                previewer = WrappedPreviewer(previewer, rate=16)
         if previewer is None:
             if latent_format.latent_rgb_factors is not None:
                 previewer = Latent2RGBPreviewer(latent_format.latent_rgb_factors, latent_format.latent_rgb_factors_bias)
